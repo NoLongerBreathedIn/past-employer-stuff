@@ -34,10 +34,20 @@ occur on the owning thread (the thread that started the service).
 - Instead of using `procedure of object`,
 everything uses `TProc`,
 allowing you to pass closures.
+(This does mean it won't compile with FreePascal.
+I think their hate of anonymous methods and closures is stupid.[^1])
 - A predefined message format is provided,
 and the `TPipeService` will automatically route messages to a specified handler.
 
 I stripped out `TPipeConsole`. It really didn't have much to do with the rest.
+
+Currently it (probably) does not compile due to me not having a copy of Delphi.
+I welcome fixes to this.
+
+[^1]: Of course I would. I come from a functional programming background.
+So much so, in fact, that it took me months to work out
+what the visitor pattern even was;
+it's just the OO equivalent of case analysis.
 
 ## ts/i18n
 A miniature internationalization framework,
