@@ -22,7 +22,8 @@ type
 // It is an error to destroy a TPoolIO from within a callback handed to it.
 // Possible statuses:
 // ERROR_SUCCESS => inline: callback will be called; in callback: success.
-// ERROR_OPERATION_ABORTED => TPoolIO is being destroyed. Do not use it further. If inline, callback will not be called.
+// ERROR_OPERATION_ABORTED => in callback: TPoolIO is being destroyed. Do not use it further. The I/O operation was cancelled.
+// ERROR_INVALID_HANDLE => inline: TPoolIO is being destroyed. Do not use it further. There will be no callback.
 // ERROR_ALREADY_CONNECTED => in callback only; informational. Treat as success.
 // ERROR_IO_PENDING => converted to success; not used.
 // ERROR_INVALID_PARAMETER => inline: possibly: you tried to read/write no data
@@ -273,7 +274,7 @@ var
 begin
   ctx := MakeCtx(Callback, Offset);
   if not TryAcquireSRWLockShared(Lock) then begin
-    Status := 995 {ERROR_OPERATION_ABORTED};
+    Status := 6 {ERROR_INVALID_HANDLE};
     FreeCtx(ctx);
     exit(False);
   end;

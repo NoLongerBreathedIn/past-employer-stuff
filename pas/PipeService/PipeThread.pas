@@ -11,6 +11,8 @@ uses
 
 type TPipeDirection = (pdRead, pdWrite, pdMisc);
 
+type EPipeError = class(Exception);
+
 // This gives out abstract references, whose ownership can cross threads.
 // Increment creates a reference. Decrement destroys one.
 // If your thread does not own a reference, it is an error to call Decrement.
@@ -131,6 +133,7 @@ type TActQueueFunc = class(TActQueue)
 // A race between SubmitPrealloc and Destroy is perfectly safe.
 // A race between either of those and setting/getting Data
 // MAY result in a memory leak, but will NOT corrupt memory.
+// IsUsable can give a spurious false result if run at the same time as setting data.
 type TPreallocAct = record
   private
     FAct: TArray<TActQueueFunc>;
@@ -140,6 +143,7 @@ type TPreallocAct = record
     class function Create(Proc: TProc<Pointer>; Clean: TProc<Pointer> = nil): TPreallocAct; static;
     class function CreateForSync(Proc: TProc<Pointer>; Clean: TProc<Pointer> = nil): TPreallocAct; static;
     procedure Destroy;
+    function  IsUsable: Boolean;
     property Data: Pointer read GetData write SetData;
   end;
 
@@ -150,23 +154,27 @@ type TSyncer = class
     FHead: TActQueue;
     FTail: PActQueue;
     EDestruct: THandle;
+    FDestroyPrealloc: TActQueue;
     FWnd: HWnd;
-    FOwningThread: Cardinal;
+    FThread: Cardinal;
     FDequeueing: Boolean;
     FReentrant: Boolean;
     FDestroying: Boolean;
-    procedure DrainQueue;
+    class var ClassAtom: NativeUInt;
     class function WndProc(Wnd: HWnd; Msg: Cardinal; WPar: WParam; LPar: LParam): LResult; stdcall; static;
+    function DrainQueue: THandle;
     function SubmitQ(Act: TActQueue): Boolean;
+    // returns whether poke failed
+    function PokeIfRequired(NewRequired: Boolean): Boolean;
     function Submit(Act: TProc; Evt: THandle = 0);
   public
     constructor Create(AllowReentry: Boolean = False);
     destructor Destroy; override;
     function SubmitWork(Act: TProc; InOrder: Boolean = True): Boolean;
     function Sync(Act: TProc): Boolean;
-    function SubmitPrealloc(Act: TPreallocAct): Boolean;
-    function OnThread: Boolean;
-    function OnStack: Boolean; inline;
+    function SubmitPrealloc(Act: TPreallocAct; InOrder: Boolean = True): Boolean;
+    function OnOwningThread: Boolean;
+    function InStack: Boolean; inline;
   end;
 
 type TSRWLockHelper = record helper for TRTLSRWLock
@@ -412,7 +420,7 @@ begin
       FCallbacks.Decrement;
       status := ERROR_NOT_ENOUGH_MEMORY;
     end;
-    if status = ERROR_OPERATION_ABORTED then begin
+    if status = ERROR_INVALID_HANDLE then begin
       FToDo := nil;
       Clear;
     end else try
@@ -424,7 +432,7 @@ end;
 
 procedure TAutoWriteQueue.ContinueSending(Instance: TCallbackInstance; Status: Cardinal; BytesWritten: NativeUInt);
 begin
-  if (Status = ERROR_OPERATION_ABORTED) or (Status = ERROR_PIPE_BROKEN) then begin
+  if (Status = ERROR_OPERATION_ABORTED) or (Status = ERROR_BROKEN_PIPE) then begin
     FToDo := nil;
     Clear;
     exit;
@@ -509,7 +517,7 @@ begin
   try
     case status of
     ERROR_BROKEN_PIPE: FBroken(Instance);
-    ERROR_OPERATION_ABORTED: exit;
+    ERROR_INVALID_HANDLE: exit;
     else
       FError(HResultFromWin32(status));
     end;
@@ -668,6 +676,264 @@ begin
   AtomicExchange(Pointer(FAct[0]), Pointer(act));
 end;
 
+function TPreallocAct.IsUsable: Boolean;
+begin
+   result := (Length(FAct) <> 0) and Assigned(FAct[0]);
+end;
 
+procedure InitClassAtom(Name: string; Proc: WNDPROC; var ClAt: NativeUInt); forward;
+
+constructor TSyncer.Create(AllowReentry: Boolean);
+begin
+  inherited Create;
+  InitClassAtom('sync_all_wnd_class', TSyncer.WndProc, TSyncer.ClassAtom);
+  FThread := GetCurrentThreadId;
+  FReentrant := AllowReentry;
+  FDestroyPrealloc := TActQueueProc.Create(
+    procedure
+    begin
+      FDestroying := True;
+    end);
+  EDestruct := CreateEventW(nil, True, False, nil);
+  if EDestruct = 0 then RaiseLastOSError;
+  FWnd := CreateWindowEx(0, PByte(TSyncer.ClassAtom), nil, 0, 0, 0, 0, 0, HWND_MESSAGE, nil, nil, Pointer(Self));
+  if FWnd = 0 then RaiseLastOSError;
+  FTail := @FHead;
+  FLock.Initialize;
+end;
+
+destructor TSyncer.Destroy;
+begin
+  if FWnd <> 0 then begin
+    if OnOwningThread then begin
+      DrainQueue;
+      DestroyWindow(FWnd);
+    end else begin
+      if not SubmitQ(FDestroyPrealloc) then begin
+        FLock.Enter;
+        FTail^ := FDestroyPrealloc;
+        FTail := @(FDestroyPrealloc.Next);
+        FLock.Leave;
+        SendMessage(FWnd, WM_USER, 0, 0);
+      end;
+      FDestroyPrealloc := nil;
+      // basically: ensures queue is drained
+      WaitForSingleObject(EDestruct, INFINITE);
+    end;
+    FLock.Destroy;
+  end;
+  CloseHandle(EDestruct);
+  FDestroyPrealloc.Free;
+  inherited Destroy;
+end;
+
+function TSyncer.SubmitWork(Act: TProc; InOrder: Boolean): Boolean;
+begin
+  if OnOwningThread and FReentrant and not InOrder then begin
+    try
+      Act();
+    except
+    end;
+    exit(True);
+  end;
+  result := Submit(Act);
+end;
+
+function TSyncer.Sync(Act: TProc): Boolean;
+var
+  evt: THandle;
+begin
+  if OnOwningThread then begin
+    try
+      Act();
+    except
+    end;
+    exit(True);
+  end;
+  evt := CreateEvent(nil, True, False, nil);
+  if evt = 0 then RaiseLastOSError;
+  result := Submit(Act, evt);
+  if result then
+    WaitForSingleObject(evt, INFINITE);
+  CloseHandle(evt);
+end;
+
+function TSyncer.SubmitPrealloc(Act: TPreallocAct; InOrder: Boolean): Boolean;
+var
+  evt: THandle;
+  action: TActQueue;
+begin
+  if Length(Act.FAct) = 0 then exit(False);
+  action := TActQueue(AtomicExchange(Pointer(Act.FAct[0]), nil));
+  if not Assigned(action) then exit(False);
+  evt := action.Event;
+  if OnOwningThread and ((FReentrant and not InOrder) or (evt <> 0)) then begin
+    try
+      action.Act;
+    except
+    end;
+    if evt <> 0 then
+      CloseHandle(evt);
+    exit(True);
+  end;
+
+  result := SubmitQ(action);
+  if not result then action.Free;
+  if evt <> 0 then begin
+    if result then
+      WaitForSingleObject(evt, INFINITE);
+    CloseHandle(evt);
+  end;
+end;
+
+function TSyncer.Submit(Act: TProc; Evt: THandle);
+var
+  action: TActQueue;
+begin
+  action := TActQueueProc.Create(Act, Evt);
+  result := SubmitQ(action);
+  if not result then action.Free;
+end;
+
+function TSyncer.OnOwningThread: Boolean;
+begin
+  result := FThread = GetCurrentThreadId;
+end;
+
+function TSyncer.InStack: Boolean;
+begin
+  // this is safe - if we're on the owning thread,
+  // FDequeueing is not being modified, because it's only modified by the owning thread under the lock.
+  result := OnOwningThread and FDequeueing;
+end;
+
+function TSyncer.DrainQueue: THandle;
+var
+  action: TActQueue;
+begin
+  result := 0;
+  FLock.Enter;
+  try
+    if FDequeueing then exit;
+  finally
+    FLock.Leave;
+  end;
+
+  while True do begin
+    FLock.Enter;
+    FDequeueing := Assigned(FHead);
+    action := FHead;
+    FHead := action.Next;
+    if not Assigned(FHead) then FTail := @FHead;
+    FLock.Leave;
+    if not Assigned(action) then break;
+    try
+      action.Act;
+    except
+    end;
+    if action.Event <> 0 then
+      SetEvent(action.Event);
+    FreeAndNil(action);
+  end;
+  if FDestroying then Result := EDestruct;
+end;
+
+class function TSyncer.WndProc(Wnd: HWnd; Msg: Cardinal; WPar: WParam; LPar: LParam): LResult;
+var
+  destHandle: THandle;
+begin
+  if Msg = WM_USER then begin
+    destHandle := TSyncer(GetWindowLongPtr(Wnd, GWLP_USERDATA)).DrainQueue;
+    if destHandle <> 0 then SetEvent(destHandle);
+    exit(0);
+  end else if Msg = WM_NCCREATE then begin
+    SetWindowLongPtr(Wnd, GWLP_USERDATA, NativeUInt(PCreateStruct(LPar)^.lpCreateParams));
+  end;
+  result := DefWindowProc(Wnd, Msg, WPar, LPar);
+end;
+
+function TSyncer.SubmitQ(Act: TActQueue): Boolean;
+var
+  initPoke: Boolean;
+begin
+  FLock.Enter;
+  initPoke := not (Assigned(FHead) or FDequeueing);
+  FTail^ := Act;
+  FTail := @(Act.Next);
+  FLock.Leave;
+  result := not PokeIfRequired(initPoke) or not initPoke;
+  if not result then begin
+    FLock.Enter;
+    result := Assigned(Act.Next);
+    if not result then begin
+      FHead := nil;
+      FTail := @FHead;
+    end;
+    FLock.Leave;
+  end;
+end;
+
+function TSyncer.PokeIfRequired(NewRequired: Boolean): Boolean;
+begin
+  result := Assigned(AtomicExchange(FNeedsPoke, nil)) or NewRequired;
+  if result then
+    result := not PostMessage(FWnd, WM_USER, 0, 0);
+  if result then AtomicExchange(FNeedsPoke, Pointer(self));
+end;
+
+var ClassLocker: TRTLSRWLock;
+
+procedure InitClassAtom(Name: string; Proc: WNDPROC; var ClAt: NativeUInt);
+var
+  newatom: NativeUInt;
+  newclass: WNDCLASS;
+begin
+  if AtomicCompareExchange(ClAt, 0, 0) <> 0 then exit;
+  ClassLocker.EnterExclusive;
+  try
+    if AtomicCompareExchange(ClAt, 0, 0) <> 0 then exit;
+    newclass := default(WNDCLASS);
+    newclass.lpszClassName := Name;
+    newclass.lpfnWndProc := Proc;
+    newclass.hInstance := HInstance;
+    newatom := RegisterClass(newclass);
+    if newatom = 0 then RaiseLastOSError;
+    AtomicExchange(ClAt, newatom);
+  finally
+    ClassLocker.LeaveExclusive;
+  end;
+end;
+
+function TSRWLockHelper.TryEnterShared: LongBool;
+begin
+  result := TryAcquireSRWLockShared(self);
+end;
+procedure TSRWLockHelper.EnterShared;
+begin
+  AcquireSRWLockShared(self);
+end;
+procedure TSRWLockHelper.LeaveShared;
+begin
+  ReleaseSRWLockShared(self);
+end;
+function TSRWLockHelper.TryEnterExclusive: LongBool;
+begin
+  result := TryAcquireSRWLockExclusive(self);
+end;
+procedure TSRWLockHelper.EnterExclusive;
+begin
+  AcquireSRWLockExclusive(self);
+end;
+procedure TSRWLockHelper.LeaveExclusive;
+begin
+  ReleaseSRWLockExclusive(self);
+end;
+procedure TSRWLockHelper.Initialize;
+begin
+  InitializeSRWLock(self);
+end;
+
+initialization
+ClassLocker.Initialize;
 
 end.
