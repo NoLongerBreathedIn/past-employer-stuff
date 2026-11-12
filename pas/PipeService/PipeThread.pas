@@ -13,6 +13,10 @@ type TPipeDirection = (pdRead, pdWrite, pdMisc);
 
 type EPipeError = class(Exception);
 
+type TMessagePumper = reference to function(var QuitParam: NativeUInt): Boolean;
+// returns whether a WM_QUIT was received;
+// if one was, its wparam is placed into QuitParam.
+
 // This gives out abstract references, whose ownership can cross threads.
 // Increment creates a reference. Decrement destroys one.
 // If your thread does not own a reference, it is an error to call Decrement.
@@ -92,6 +96,11 @@ type TPipeReader = class
     function Start: Boolean;
   end;
 
+function WrapStreamInReader(Message: TStream): TStreamReader;
+// wraps in a TStreamReader that owns the stream.
+// NOTE: if this raises, the stream gets freed.
+function ReadPipeMessageHeader(Message: TStreamReader): TArray;
+
 // Internal use only.
 type TActQueue = class abstract
   strict private
@@ -170,6 +179,7 @@ type TSyncer = class
   public
     constructor Create(AllowReentry: Boolean = False);
     destructor Destroy; override;
+    class function HandleSyncerMessage(var QuitParam): Boolean;
     function SubmitWork(Act: TProc; InOrder: Boolean = True): Boolean;
     function Sync(Act: TProc): Boolean;
     function SubmitPrealloc(Act: TPreallocAct; InOrder: Boolean = True): Boolean;
@@ -582,6 +592,20 @@ begin
   ReadMore(Instance);
 end;
 
+function WrapStreamInReader(Message: TStream): TStreamReader;
+begin
+  try
+    result := TStreamReader.Create(Message, TEncoding.UTF8);
+  except
+    Message.Free;
+    raise;
+  end;
+  result.OwnStream; // thankfully, this just sets a flag.
+end;
+function ReadPipeMessageHeader(Message: TStreamReader): TArray;
+begin
+  result := Message.ReadLine.Split([#31]);
+end;
 
 constructor TActQueue.Create(Evt: THandle);
 begin
@@ -683,6 +707,8 @@ end;
 
 procedure InitClassAtom(Name: string; Proc: WNDPROC; var ClAt: NativeUInt); forward;
 
+const WM_SYNCER = $5A17;
+
 constructor TSyncer.Create(AllowReentry: Boolean);
 begin
   inherited Create;
@@ -714,7 +740,7 @@ begin
         FTail^ := FDestroyPrealloc;
         FTail := @(FDestroyPrealloc.Next);
         FLock.Leave;
-        SendMessage(FWnd, WM_USER, 0, 0);
+        SendMessage(FWnd, WM_SYNCER, 0, 0);
       end;
       FDestroyPrealloc := nil;
       // basically: ensures queue is drained
@@ -842,7 +868,7 @@ class function TSyncer.WndProc(Wnd: HWnd; Msg: Cardinal; WPar: WParam; LPar: LPa
 var
   destHandle: THandle;
 begin
-  if Msg = WM_USER then begin
+  if Msg = WM_SYNCER then begin
     destHandle := TSyncer(GetWindowLongPtr(Wnd, GWLP_USERDATA)).DrainQueue;
     if destHandle <> 0 then SetEvent(destHandle);
     exit(0);
@@ -877,8 +903,19 @@ function TSyncer.PokeIfRequired(NewRequired: Boolean): Boolean;
 begin
   result := Assigned(AtomicExchange(FNeedsPoke, nil)) or NewRequired;
   if result then
-    result := not PostMessage(FWnd, WM_USER, 0, 0);
+    result := not PostMessage(FWnd, WM_SYNCER, 0, 0);
   if result then AtomicExchange(FNeedsPoke, Pointer(self));
+end;
+
+class function TSyncer.HandleSyncerMessage(var QuitParam: NativeUInt);
+var
+  Mesg: TMessage;
+begin
+  if GetMessage(Mesg, nil, WM_SYNCER, WM_SYNCER) = 0 then begin
+    QuitParam := Mesg.WParam;
+    exit(True);
+  end;
+  DispatchMessage(Mesg);
 end;
 
 var ClassLocker: TRTLSRWLock;
